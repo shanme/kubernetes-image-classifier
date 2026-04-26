@@ -1,0 +1,71 @@
+[project]
+name = "image-classifier"
+requires-python = ">=3.12"
+version = "0.1.0"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "Pillow>=10.0.0",
+    "pydantic-settings>=2.4.0",
+    "python-multipart>=0.0.9",
+    "prometheus-fastapi-instrumentator>=7.0.0",
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[tool.uv]
+managed = true
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6.0",
+    "locust>=2.31.0",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",        # pycodestyle (style erros)
+    "W",        # pycodestyle (style warnings)
+    "F",        # Pyflakes (flakes)
+    "I",        # isort (import sort)
+    "UP",       # pyupgrade (transforms old syntax to Python 3.12)
+    "B",        # flake8-bugbear (find bugs)
+    "SIM",      # flake8-simplify (simplifies the code)
+    "N",        # pep8-naming (checks that classes are CamelCase, and functions with variables are snake_case)
+    "C4",       # flake8-comprehensions (optimizes dictionaries and lists)
+    "RUF",      # Rules of the Ruff
+    "ASYNC",    # Async code check
+    "PTH",      # pathlib instead of os.path
+    "D",        # pydocstyle (docstring check)
+]
+
+ignore = [
+    "B008",     # Allows Depends() in functions arguments
+    "D100",     # Missing docstring in public module
+    "D104",     # Missing docstring in public package (usually for __init__.py)
+    "D107",     # Missing docstring in __init__ (redundant if class has docstring)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
