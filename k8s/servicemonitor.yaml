@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: image-classifier-monitor
+  labels:
+    release: kube-prom
+spec:
+  selector:
+    matchLabels:
+      app: image-classifier
+  namespaceSelector:
+    any: true  
+  endpoints:
+  - port: http
+    path: /metrics 

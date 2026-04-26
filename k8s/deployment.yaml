@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: image-classifier-deployment
+  labels:
+    app: image-classifier
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: image-classifier
+  template:
+    metadata:
+      labels:
+        app: image-classifier
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+      - name: image-classifier
+        image: image-classifier:latest
+        ports:
+        - containerPort: 4123
+        imagePullPolicy: Never
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 4123
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 4123
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 5

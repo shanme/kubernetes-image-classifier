@@ -1,0 +1,13 @@
+app/__pycache__
+image.png
+.venv
+.uv
+__pycache__
+.git
+.pytest_cache
+.ruff_cache
+*.pyc
+outputs/
+data/
+*.env
+locustfile.py
