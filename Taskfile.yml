@@ -1,0 +1,256 @@
+version: '3'
+
+dotenv: ['.env']
+
+vars:
+  APP_NAME: image-classifier
+  PORT: '{{default "4123" .PORT}}'
+  USERS: '{{default "20" .USERS}}'
+  RATE: '{{default "2" .RATE}}'
+
+tasks:
+  default:
+    silent: true
+    cmds:
+      - task --list
+
+  # --- Environment ---
+  setup:
+    desc: "Sync dependencies via uv"
+    silent: true
+    internal: true
+    sources: [pyproject.toml, uv.lock]
+    generates: [.venv/pyvenv.cfg]
+    cmds:
+      - uv sync --frozen --all-groups
+    preconditions:
+      - sh: command -v uv >/dev/null 2>&1
+        msg: "❌ 'uv' is not installed. Install it: https://docs.astral.sh/uv/"
+
+  run:
+    desc: "Run locally"
+    deps: [setup]
+    cmds:
+      - uv run uvicorn app.main:app --host 0.0.0.0 --port {{.PORT}} --reload
+
+  # --- Quality ---
+  lint:
+    desc: "Fast lint + forward"
+    silent: true
+    deps: [setup]
+    aliases: [l]
+    cmds:
+      - uv run ruff format .
+      - uv run ruff check --fix
+    sources: ["**/*.py", "pyproject.toml"]
+
+  build:
+    internal: true
+    silent: true
+    vars:
+      CALC_HASH:
+        sh: >
+          python -c "import hashlib, pathlib; ignore = {'.venv', '.git', '.ruff_cache', '__pycache__'}; files = [p for p in pathlib.Path('.').rglob('*.py') if not set(p.parts) & ignore]; files.extend(map(pathlib.Path, ['uv.lock', 'Dockerfile'])); print(hashlib.md5(b''.join(f.read_bytes() for f in sorted(files) if f.is_file())).hexdigest()[:8])" 2>/dev/null || echo "dev"
+      IMAGE_TAG: '{{default (printf "dev-%s" .CALC_HASH) .IMAGE_TAG}}'
+      IMG_IDS:
+        sh: docker images -q {{.APP_NAME}}
+      K8S_CONTEXT:
+        sh: kubectl config current-context 2>/dev/null || echo "unknown"
+    cmds:
+      - echo "🐳 Building {{.APP_NAME}}:{{.IMAGE_TAG}}..."
+      - docker image prune -f --filter "label=app={{.APP_NAME}}" || true
+      - docker build -t {{.APP_NAME}}:{{.IMAGE_TAG}} --label "app={{.APP_NAME}}" .
+
+      - |
+        python -c "
+        import os, subprocess, sys
+        ctx = '{{.K8S_CONTEXT}}'.strip()
+        img = '{{.APP_NAME}}:{{.IMAGE_TAG}}'
+
+        print(f'🔍 K8s Context detected: {ctx}')
+
+        try:
+            if 'minikube' in ctx:
+                print(f'📦 Loading {img} into Minikube...')
+                subprocess.run(['minikube', 'image', 'load', img], check=True)
+            elif 'kind' in ctx:
+                print(f'📦 Loading {img} into Kind...')
+                subprocess.run(['kind', 'load', 'docker-image', img], check=True)
+            elif 'docker-desktop' in ctx:
+                print(f'✅ Docker Desktop context. Image cache is shared, no load needed.')
+            else:
+                print(f'⚠️  WARNING: Unknown context ({ctx}). K8s might not see the image locally!')
+        except Exception as e:
+            print(f'❌ Failed to load image into cluster: {e}')
+            sys.exit(1)"
+
+
+  k8s-apply:
+    internal: true
+    silent: true
+    cmds:
+      - kubectl apply -R -f k8s/
+
+  k8s-setup-monitoring:
+    internal: true
+    silent: true
+    status:
+      - helm status kube-prom -n monitoring >/dev/null 2>&1
+    cmds:
+      - helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      - helm repo update prometheus-community
+      - helm upgrade --install kube-prom prometheus-community/kube-prometheus-stack --namespace monitoring --create-namespace --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false --set nodeExporter.enabled=false
+
+      - echo "⏳ Waiting for Grafana to be ready..."
+      - kubectl wait --namespace monitoring --for=condition=ready pod --selector=app.kubernetes.io/name=grafana --timeout=120s
+
+
+  start:
+    desc: "🚀 FULL SETUP: Build, deploy to K8s, setup monitoring"
+    deps: [check-tools]
+    vars:
+      APP_HASH:
+        sh: >
+          python -c "import hashlib, glob, os;
+          ignore = {'.venv', '.git', '.ruff_cache', '__pycache__'};
+          files = [p for p in pathlib.Path('.').rglob('*.py') if not set(p.parts) & ignore];
+          files.extend(map(pathlib.Path, ['uv.lock', 'Dockerfile']));
+          print(hashlib.md5(b''.join(f.read_bytes() for f in sorted(files) if f.is_file())).hexdigest()[:8])" 2>/dev/null || echo "dev"
+      IMAGE_TAG: '{{.APP_HASH}}'
+    silent: true
+    cmds:
+      - task: build
+        vars: { IMAGE_TAG: '{{.IMAGE_TAG}}' }
+      - task: k8s-setup-monitoring
+      - task: k8s-apply
+
+
+      - echo "🔄 Rolling out new image..."
+      - kubectl set image deployment/image-classifier-deployment image-classifier={{.APP_NAME}}:{{.IMAGE_TAG}}
+      - kubectl rollout status deployment image-classifier-deployment --timeout=120s
+
+
+      - echo "---------------------------------------"
+      - echo "✅ Successfully deployed!"
+
+      - echo "🔑 Grafana Password (user 'admin'):"
+      - kubectl get secret -n monitoring kube-prom-grafana -o go-template='{{"{{index .data \"admin-password\" | base64decode}}"}}'
+
+      - echo ""
+      - echo ""
+      - echo "🚀 NEXT STEPS:"
+      - cmd: 'echo "  1. Run ''task test'' (this will start port-forwards and load testing)"'
+      - cmd: 'echo "  2. Open Grafana: http://localhost:3000"'
+      - cmd: 'echo "  3. Open Locust:  http://localhost:8089 (optional)"'
+      - cmd: 'echo "  4. Open api interface:  http://localhost/docs (optional)"'
+      - echo "---------------------------------------"
+
+  test:
+    desc: "Run everything in one terminal: Tunnels + Locust"
+    interactive: true
+    silent: true
+    cmds:
+      - |
+        python -c "
+        import subprocess, socket, time, sys
+
+        print('🔌 Starting Port Forwarding to Grafana...')
+        pf_proc = subprocess.Popen(
+            ['kubectl', 'port-forward', 'svc/kube-prom-grafana', '3000:80', '-n', 'monitoring'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+        try:
+            print('⏳ Waiting for port 3000...')
+            start = time.time()
+            while time.time() - start < 15:
+                try:
+                    with socket.create_connection(('localhost', 3000), timeout=1):
+                        print('✅ Port 3000 is READY!')
+                        break
+                except OSError:
+                    time.sleep(0.5)
+            else:
+                print('❌ Timeout waiting for port-forward')
+                sys.exit(1)
+
+            print('🔥 Starting Load Test (Users: {{.USERS}}, Rate: {{.RATE}}) 🔥')
+            subprocess.run(['uv', 'run', 'locust', '-f', 'locustfile.py', '--host', 'http://localhost', '-u', '{{.USERS}}', '-r', '{{.RATE}}', '--autostart'])
+
+        except KeyboardInterrupt:
+            print('\n🛑 Stopping gracefully...')
+        finally:
+            print('🧹 Cleaning up Port Forwarding...')
+            pf_proc.terminate()
+            pf_proc.wait()
+        "
+
+  down:
+    desc: "Remove only the application (keep monitoring)"
+    silent: true
+    cmds:
+      - echo "🧹 Removing app resources..."
+      - kubectl delete -R -f k8s/ --ignore-not-found
+
+  teardown:
+    desc: "NUCLEAR: Delete EVERYTHING (App + Monitoring + Namespace)"
+    silent: true
+    cmds:
+      - task: down
+      - echo "🧹 Uninstalling monitoring stack..."
+      - helm uninstall kube-prom -n monitoring --ignore-not-found
+      - echo "💥 Deleting monitoring namespace..."
+      - kubectl delete namespace monitoring --ignore-not-found
+      - echo "✨ Cluster is clean."
+
+  # --- Cleanup ---
+  clean:
+    desc: "Remove caches and temporary files"
+    aliases: [c]
+    silent: true
+    cmds:
+      - echo "🧹 Cleaning top-level caches..."
+      - rm -rf .pytest_cache .ruff_cache .uv .pf.pid pf.log
+
+      - echo "🧹 Deep cleaning __pycache__ and bytecodes..."
+      - |
+        python -c "
+        import pathlib, shutil
+        for p in pathlib.Path('.').rglob('__pycache__'):
+            if p.is_dir(): shutil.rmtree(p, ignore_errors=True)
+        for p in pathlib.Path('.').rglob('*.py[co]'):
+            p.unlink(missing_ok=True)
+        "
+
+      - echo "🧹 Cleaning docker images..."
+      - docker image prune -f
+
+  check-tools:
+    desc: "Healthcheck for required CLI tools"
+    internal: true
+    silent: true
+    cmds:
+      - |
+        python -c "
+        import shutil, sys
+
+        tools = {
+            'uv': 'https://docs.astral.sh/uv/getting-started/installation/',
+            'docker': 'https://docs.docker.com/get-docker/',
+            'kubectl': 'https://kubernetes.io/docs/tasks/tools/',
+            'helm': 'https://helm.sh/docs/intro/install/'
+        }
+
+        missing = False
+        print('🩺 Checking system requirements...')
+        for tool, link in tools.items():
+            if shutil.which(tool):
+                print(f'  ✅ {tool} is installed')
+            else:
+                print(f'  ❌ {tool} is MISSING! Install it here: {link}')
+                missing = True
+
+        if missing:
+            print('\n🛑 Please install missing tools and try again.')
+            sys.exit(1)
+        "
