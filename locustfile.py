@@ -23,5 +23,9 @@ class ImageClassifierUser(HttpUser):
         to measure the API's throughput and response time under load.
         """
         self.client.post(
-            "/predict", files={"image": ("image.png", IMAGE_CONTENT, "image/png")}
+            "/predict",
+            files={
+                "image": ("image.png", IMAGE_CONTENT, "image/png"),
+            },
+            headers={"Connection": "close"},
         )
